@@ -1,0 +1,133 @@
+app: vjepa
+nodes: 1
+tasks_per_node: 1
+cpus_per_task: 8
+mem_per_gpu: 24G
+folder: /checkpoints/pretrain/16.8.vitl.225px.16f
+data:
+  dataset_type: VideoDataset
+  datasets:
+  - /home/vjepa2-deepspeed/datasets/kinetics_700/kinetics_700_train_path_shuffled.csv
+  - /home/vjepa2-deepspeed/datasets/Something_Something_v2_deepspeed/ssv2_train_paths.csv
+  - /home/vjepa2-deepspeed/datasets/imagenet_1k/imagenet_1k_train_path_100_samples.csv
+  datasets_weights:
+  - 0.50
+  - 0.35
+  - 0.15
+  batch_size: 96
+  crop_size: 256
+  patch_size: 16
+  dataset_fpcs:
+  - 16
+  - 16
+  - 16
+  tubelet_size: 2
+  fps: 4
+  num_workers: 2
+  persistent_workers: true
+  pin_mem: false
+data_aug:
+  auto_augment: false
+  motion_shift: false
+  random_resize_aspect_ratio:
+  - 0.75
+  - 1.35
+  random_resize_scale:
+  - 0.3
+  - 1.0
+  reprob: 0.0
+data_probe:
+  dataset_type: VideoDataset
+  datasets_train:
+    - /home/vjepa2-deepspeed/datasets/ssv2_small_balanced_deepspeed/ssv2_train_paths_10_samples.csv
+  datasets_val:
+    - /home/vjepa2-deepspeed/datasets/ssv2_small_balanced_deepspeed/ssv2_val_paths_2_sample.csv
+  datasets_weights_train:
+  - 1.0
+  datasets_weights_val:
+  - 1.0
+  batch_size: 96
+  crop_size: 224
+  patch_size: 16
+  dataset_fpcs:
+    - 16
+  tubelet_size: 2
+  fps: 4
+  num_workers: 2
+  persistent_workers: true
+  pin_mem: false
+loss:
+  loss_exp: 1.0
+mask:
+- aspect_ratio:
+  - 0.75
+  - 1.5
+  full_complement: false
+  max_keep: null
+  max_temporal_keep: 1.0
+  num_blocks: 8
+  spatial_scale:
+  - 0.15
+  - 0.15
+  temporal_scale:
+  - 1.0
+  - 1.0
+- aspect_ratio:
+  - 0.75
+  - 1.5
+  full_complement: false
+  max_keep: null
+  max_temporal_keep: 1.0
+  num_blocks: 2
+  spatial_scale:
+  - 0.7
+  - 0.7
+  temporal_scale:
+  - 1.0
+  - 1.0
+meta:
+  dtype: bfloat16
+  model_eval: false
+  eval_freq: 50
+  monitor_freq: 20
+  load_checkpoint: True
+  load_checkpoint_epoch: 0
+  read_checkpoint: null
+  save_every_freq: 5
+  save_checkpoint_steps: 50
+  seed: 239
+  use_sdpa: true
+  enable_probe: true
+  accumulation_steps: 1
+model:
+  model_name: vit_large
+  pred_depth: 12
+  pred_embed_dim: 384
+  pred_num_heads: 12
+  uniform_power: true
+  use_activation_checkpointing: true
+  use_mask_tokens: true
+  use_rope: true
+  zero_init_mask_tokens: true
+  compile_model: false
+optimization:
+  ema:
+  - 0.996
+  - 0.9999
+  betas:
+  - 0.9
+  - 0.999
+  epochs: 60
+  anneal: 0
+  final_lr: 1.0e-6
+  final_weight_decay: 0.02
+  ipe: 300
+  ipe_scale: 1.0
+  lr: 5.0e-5
+  start_lr: 5e-6
+  warmup: 20
+  stable_lr: 2.05e-5
+  weight_decay: 0.02
+  base_lr_encoder: 5.0e-4
+  base_lr_predictor: 1.0e-3
+

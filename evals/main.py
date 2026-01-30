@@ -2,10 +2,13 @@
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
-
+import os
+# Force disable P2P and IB, as they are not supported by the current cloud container,
+# if your env is supported, please set to 0 to speed up communication
+os.environ["NCCL_P2P_DISABLE"] = "1"
+os.environ["NCCL_IB_DISABLE"] = "1"
 import argparse
 import multiprocessing as mp
-import os
 import pprint
 
 import yaml

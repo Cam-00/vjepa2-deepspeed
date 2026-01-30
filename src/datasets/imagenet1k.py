@@ -20,7 +20,7 @@ class ImageNet(torchvision.datasets.ImageFolder):
 
     def __init__(
         self,
-        root,
+        root,  # 数据集根目录路径
         image_folder="imagenet_full_size/061417/",
         tar_file="imagenet_full_size-061417.tar.gz",
         transform=None,
@@ -52,17 +52,21 @@ class ImageNet(torchvision.datasets.ImageFolder):
         if index_targets:
             self.targets = []
             for sample in self.samples:
-                self.targets.append(sample[1])
+                self.targets.append(sample[1])  # labels
+
             self.targets = np.array(self.targets)
             self.samples = np.array(self.samples)
 
-            mint = None
+            mint = None  # log category of the least min sample
             self.target_indices = []
+
             for t in range(len(self.classes)):
                 indices = np.squeeze(np.argwhere(self.targets == t)).tolist()
                 self.target_indices.append(indices)
+
                 mint = len(indices) if mint is None else min(mint, len(indices))
                 logger.debug(f"num-labeled target {t} {len(indices)}")
+
             logger.info(f"min. labeled indices {mint}")
 
 
@@ -136,7 +140,8 @@ def make_imagenet1k(
     if subset_file is not None:
         dataset = ImageNetSubset(dataset, subset_file)
     logger.info("ImageNet dataset created")
-    dist_sampler = torch.utils.data.distributed.DistributedSampler(dataset=dataset, num_replicas=world_size, rank=rank)
+    dist_sampler = torch.utils.data.distributed.DistributedSampler(dataset=dataset, num_replicas=world_size, rank=rank,
+                                                                   drop_last=True)
     data_loader = torch.utils.data.DataLoader(
         dataset,
         collate_fn=collator,

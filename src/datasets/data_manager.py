@@ -9,35 +9,37 @@ _GLOBAL_SEED = 0
 logger = getLogger()
 
 
+# 数据加载初始化(包含数据预处理), 返回 data_loader, dist_sampler
 def init_data(
-    batch_size,
-    transform=None,
-    shared_transform=None,
-    data="ImageNet",
-    collator=None,
-    pin_mem=True,
-    num_workers=8,
-    world_size=1,
-    rank=0,
-    root_path=None,
-    image_folder=None,
-    training=True,
-    drop_last=True,
-    subset_file=None,
-    clip_len=None,
-    dataset_fpcs=None,
-    frame_sample_rate=None,
-    duration=None,
-    fps=None,
-    num_clips=1,
-    random_clip_sampling=True,
-    allow_clip_overlap=False,
-    filter_short_videos=False,
-    filter_long_videos=int(1e9),
-    datasets_weights=None,
-    persistent_workers=False,
-    deterministic=True,
-    log_dir=None,
+    batch_size,  # Number of samples per batch
+    transform=None,  # Data augmentation for individual samples, including spatial resizing/cropping of clips (e.g., 224x224 or 256x256)
+    shared_transform=None,  # Shared transformations applied across all samples (e.g., consistent processing for multi-frame video)
+    data="ImageNet",  # Dataset type (default: ImageNet)
+    collator=None,  # Mask collator settings; both V-JEPA and V-JEPA 2 use multi-block masking
+    pin_mem=True,  # Whether to use pinned memory (accelerates data transfer to GPU)
+    num_workers=8,  # Number of subprocesses for data loading
+    world_size=1,  # Total number of processes for distributed training
+    rank=0,  # Rank of the current process
+    root_path=None,  # Root directory path of the dataset
+    image_folder=None,  # Image subdirectory name (specific to classification datasets)
+    training=True,  # Whether to load the ImageNet training set; otherwise loads the validation set
+    enable_probe=False,  # Whether to enable model performance validation within the training loop
+    drop_last=True,  # Whether to discard the last incomplete batch
+    subset_file=None,  # Path to the file specifying a data subset
+    clip_len=None,  # Number of frames per clip (specific to video datasets)
+    dataset_fpcs=None,  # Custom frames per clip (fpcs) for each dataset
+    frame_sample_rate=None,  # Sampling interval between video frames
+    duration=None,  # Clip duration in seconds
+    fps=None,  # Video frames per second (FPS)
+    num_clips=1,  # Number of clips to sample from each video
+    random_clip_sampling=True,  # Whether to sample clips randomly
+    allow_clip_overlap=False,  # Whether to allow overlap between sampled clips
+    filter_short_videos=False,  # Whether to filter out videos that are too short
+    filter_long_videos=int(1e9),  # Threshold for filtering out excessively long videos
+    datasets_weights=None,  # Sampling weights for each dataset in a multi-dataset setup
+    persistent_workers=False,  # Whether to keep worker processes alive between epochs
+    deterministic=True,  # Whether to enable deterministic mode
+    log_dir=None,  # Directory for storing logs
 ):
     if data.lower() == "imagenet":
         from src.datasets.imagenet1k import make_imagenet1k
@@ -85,6 +87,7 @@ def init_data(
             rank=rank,
             deterministic=deterministic,
             log_dir=log_dir,
+            enable_probe=enable_probe,
         )
 
     return (data_loader, dist_sampler)

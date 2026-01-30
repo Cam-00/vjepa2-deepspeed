@@ -13,7 +13,7 @@ import yaml
 import src.models.predictor as vit_pred
 import src.models.vision_transformer as video_vit
 from src.utils.checkpoint_loader import robust_checkpoint_loader
-from src.utils.schedulers import CosineWDSchedule, WarmupCosineSchedule
+from src.utils.schedulers import CosineWDSchedule, WarmupCosineSchedule, WSDSchedule
 from src.utils.wrappers import MultiSeqWrapper, PredictorMultiSeqWrapper
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
@@ -211,6 +211,7 @@ def init_opt(
     start_lr,
     ref_lr,
     warmup,
+    anneal,
     num_epochs,
     wd=1e-6,
     final_wd=1e-6,
@@ -220,6 +221,7 @@ def init_opt(
     betas=(0.9, 0.999),
     eps=1e-8,
     zero_init_bias_wd=True,
+    accumulation_steps=1,
 ):
     param_groups = [
         {"params": (p for n, p in encoder.named_parameters() if ("bias" not in n) and (len(p.shape) != 1))},
@@ -237,19 +239,33 @@ def init_opt(
     ]
 
     optimizer = torch.optim.AdamW(param_groups, betas=betas, eps=eps)
+
     scheduler = WarmupCosineSchedule(
         optimizer,
-        warmup_steps=int(warmup * iterations_per_epoch),
+        warmup_steps=int(warmup * iterations_per_epoch // accumulation_steps),
         start_lr=start_lr,
         ref_lr=ref_lr,
         final_lr=final_lr,
-        T_max=int(ipe_scale * num_epochs * iterations_per_epoch),
+        T_max=int(ipe_scale * num_epochs * iterations_per_epoch // accumulation_steps),
     )
+
+    # # vjepa2 origin lr scheduler
+    # scheduler = WSDSchedule(
+    #     optimizer,
+    #     warmup_steps=int(warmup * iterations_per_epoch),
+    #     anneal_steps=int(anneal * iterations_per_epoch),
+    #     start_lr=start_lr,
+    #     ref_lr=ref_lr,
+    #     final_lr=final_lr,
+    #     T_max=int(num_epochs * iterations_per_epoch),
+    # )
+
     wd_scheduler = CosineWDSchedule(
         optimizer,
         ref_wd=wd,
         final_wd=final_wd,
-        T_max=int(ipe_scale * num_epochs * iterations_per_epoch),
+        T_max=int(ipe_scale * num_epochs * iterations_per_epoch // accumulation_steps),
     )
-    scaler = torch.cuda.amp.GradScaler() if mixed_precision else None
+
+    scaler = torch.amp.GradScaler('cuda') if mixed_precision else None
     return optimizer, scaler, scheduler, wd_scheduler

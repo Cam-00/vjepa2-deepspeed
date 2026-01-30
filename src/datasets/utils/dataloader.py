@@ -163,7 +163,7 @@ class _SloppyMultiProcessingDataLoaderIter(_MultiProcessingDataLoaderIter):
         super().__init__(*args, **kwargs)
 
     def _next_data(self):
-        """Adds out of order returns."""
+        """Adds out of order returns. add shuffle return function"""
         while True:
             # If the worker responsible for `self._rcvd_idx` has already ended
             # and was unable to fulfill this task (due to exhausting an `IterableDataset`),

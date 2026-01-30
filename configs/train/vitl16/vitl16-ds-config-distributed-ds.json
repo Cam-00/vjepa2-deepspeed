@@ -1,0 +1,67 @@
+{
+  "train_micro_batch_size_per_gpu": 96,
+  "gradient_accumulation_steps": 1,
+  "steps_per_print": 10,
+  "wall_clock_breakdown": false,
+  "dump_state": false,
+
+  "fp16": {
+    "enabled": false,
+    "auto_cast": false,
+    "loss_scale": 0,
+    "loss_scale_window": 100,
+    "initial_scale_power": 12,
+    "hysteresis": 2,
+    "min_loss_scale": 1,
+    "fp16_master_weights_and_grads": false
+  },
+
+  "bf16": {
+    "enabled": true
+  },
+
+  "zero_optimization": {
+    "stage": 2,
+    "offload_optimizer": {
+      "device": "none",
+      "pin_memory": false
+    },
+    "offload_param": {
+      "device": "none"
+    },
+    "allgather_partitions": true,
+    "allgather_bucket_size": 50000000,
+    "overlap_comm": true,
+    "reduce_scatter": true,
+    "reduce_bucket_size": 50000000,
+    "contiguous_gradients": true,
+    "round_robin_gradients": true
+  },
+
+  "gradient_clipping": 0.5,
+  "prescale_gradients": false,
+  "communications_backend": "nccl",
+
+  "activation_checkpointing": {
+    "partition_activations": false,
+    "contiguous_memory_optimization": false,
+    "cpu_checkpointing": false,
+    "number_checkpoints": null,
+    "synchronize_checkpoint_boundary": false
+  },
+
+  "flops_profiler": {
+    "enabled": false,
+    "profile_step": 1,
+    "module_depth": -1,
+    "top_modules": 1,
+    "detailed": true
+  },
+
+  "memory_breakdown": false,
+  "tensorboard": {
+    "enabled": true,
+    "output_path": " /checkpoints/pretrain/16.8.vitl.225px.16f/deepspeed_dist_tensorboard",
+    "job_name": "vjepa2_deepspeed_dist"
+  }
+}

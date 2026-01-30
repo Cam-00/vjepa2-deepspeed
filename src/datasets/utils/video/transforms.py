@@ -1038,7 +1038,7 @@ class CenterCrop(object):
             )
         if w > im_w or h > im_h:
             error_msg = (
-                "Initial image size should be larger then "
+                "Initial image size should be larger than "
                 "cropped size but got cropped sizes : ({w}, {h}) while "
                 "initial image is ({im_w}, {im_h})".format(im_w=im_w, im_h=im_h, w=w, h=h)
             )

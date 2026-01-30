@@ -63,7 +63,8 @@ class VisionTransformer(nn.Module):
 
         self.use_activation_checkpointing = use_activation_checkpointing
 
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
+        # stochastic depth decay rule
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # (depth, )
 
         # Tokenize pixels with convolution
         if self.is_video:
@@ -81,12 +82,12 @@ class VisionTransformer(nn.Module):
         if self.use_rope:
             self.pos_embed = None
         else:
-            self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim), requires_grad=False)
+            self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim), requires_grad=False)  # [1, N, D]
 
         # Attention Blocks
         self.blocks = nn.ModuleList(
             [
-                Block(
+                Block(  # RoPe implementation in Block.RoPEAttention.rotate_queries_or_keys
                     use_rope=use_rope,
                     grid_size=img_size[0] // patch_size,
                     grid_depth=num_frames // tubelet_size,
@@ -95,7 +96,7 @@ class VisionTransformer(nn.Module):
                     mlp_ratio=mlp_ratio,
                     use_sdpa=use_sdpa,
                     qkv_bias=qkv_bias,
-                    qk_scale=qk_scale,
+                    qk_scale=qk_scale,   # whether to scale qk
                     drop=drop_rate,
                     act_layer=nn.SiLU if use_silu else nn.GELU,
                     wide_silu=wide_silu,
@@ -125,7 +126,7 @@ class VisionTransformer(nn.Module):
             )
         else:
             sincos = get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False)
-        pos_embed.copy_(torch.from_numpy(sincos).float().unsqueeze(0))
+        pos_embed.copy_(torch.from_numpy(sincos).float().unsqueeze(0))  # copy_()括号内的shape: [1, N, D], N = T*H*W
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -160,7 +161,7 @@ class VisionTransformer(nn.Module):
 
     def forward(self, x, masks=None):
         """
-        :param x: input image/video
+        :param x: input image/video , shape is (B, C, T, H, W)
         :param masks: indices of patch tokens to mask (remove)
         """
         if masks is not None and not isinstance(masks, list):
@@ -173,7 +174,7 @@ class VisionTransformer(nn.Module):
             T = 1
         # Video
         elif x.ndim == 5:
-            _, _, T, H, W = x.shape
+            _, _, T, H, W = x.shape      # (B, C, T, H, W) , C = 3
             T = T // self.tubelet_size
         H_patches = H // self.patch_size
         W_patches = W // self.patch_size
@@ -181,16 +182,19 @@ class VisionTransformer(nn.Module):
             T = H_patches = W_patches = None
 
         if not self.use_rope:
-            pos_embed = self.interpolate_pos_encoding(x, self.pos_embed)
-            x = self.patch_embed(x)
-            x += pos_embed
-        else:
-            x = self.patch_embed(x)
+            # self.pos_embed : tensor(1, N, D)
+            pos_embed = self.interpolate_pos_encoding(x, self.pos_embed)  # tensor(1, N, D)
+            x = self.patch_embed(x)     # tensor(B, N, D)
+            x += pos_embed              # tensor(B, N, D)
+        else:  # use RoPE, implementation in Attention block
+            x = self.patch_embed(x)   # (B, N, D), D = embed_dim, N = (T//tubelet_size)*(H//patch_size)*(W//patch_size)
 
         # Mask away unwanted tokens (if masks provided)
         if masks is not None:
-            x = apply_masks(x, masks)
-            masks = torch.cat(masks, dim=0)
+            # masks : list of tensors of shape [B, K] containing indices of K patches in [N] to keep
+
+            x = apply_masks(x, masks)  # a tensor(B, K, D) , K < N , K :number of visible patch
+            masks = torch.cat(masks, dim=0)  # a tensor(B, K)
 
         # Fwd prop
         outs = []
@@ -200,7 +204,7 @@ class VisionTransformer(nn.Module):
                     blk, x, masks, None, T=T, H_patches=H_patches, W_patches=W_patches, use_reentrant=False
                 )
             else:
-                x = blk(x, mask=masks, attn_mask=None, T=T, H_patches=H_patches, W_patches=W_patches)
+                x = blk(x, mask=masks, attn_mask=None, T=T, H_patches=H_patches, W_patches=W_patches)  # tensor(B, N, D), N = K if apply masks
             if self.out_layers is not None and i in self.out_layers:
                 outs.append(self.norm(x))
 
@@ -210,7 +214,7 @@ class VisionTransformer(nn.Module):
         if self.norm is not None:
             x = self.norm(x)
 
-        return x
+        return x   # tensor(B, N, D), N = K if apply masks
 
     def interpolate_pos_encoding(self, x, pos_embed):
 
@@ -234,8 +238,7 @@ class VisionTransformer(nn.Module):
             H = H // self.patch_size
             W = W // self.patch_size
 
-            # Compute the initialized shape of the positional embedding measured
-            # in patches
+            # Compute the initialized shape of the positional embedding measured in patches
             N_t = self.num_frames // self.tubelet_size
             N_h = self.img_height // self.patch_size
             N_w = self.img_width // self.patch_size
@@ -248,9 +251,11 @@ class VisionTransformer(nn.Module):
                 pos_embed.reshape(1, N_t, N_h, N_w, dim).permute(0, 4, 1, 2, 3),
                 scale_factor=scale_factor,
                 mode="trilinear",
-            )
-            pos_embed = pos_embed.permute(0, 2, 3, 4, 1).view(1, -1, dim)
-            return pos_embed
+            )   # (1, dim, scale_factor[0]*N_t, scale_factor[1]*N_h, scale_factor[2]*N_w)
+
+            # N = scale_factor[0]*N_t * scale_factor[1]*N_h * scale_factor[2]*N_w
+            pos_embed = pos_embed.permute(0, 2, 3, 4, 1).view(1, -1, dim)  # (1, N, D)
+            return pos_embed   # (1, N, D)
 
         else:
 
@@ -275,10 +280,10 @@ class VisionTransformer(nn.Module):
 def vit_large(patch_size=16, **kwargs):
     model = VisionTransformer(
         patch_size=patch_size,
-        embed_dim=1024,
-        depth=24,
-        num_heads=16,
-        mlp_ratio=4,
+        embed_dim=1024,  # 1024
+        depth=24,  # 24
+        num_heads=16,  # 16
+        mlp_ratio=4,  # 4
         qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6),
         **kwargs

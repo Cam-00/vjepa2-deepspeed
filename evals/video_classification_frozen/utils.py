@@ -5,6 +5,7 @@
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torchvision.transforms as transforms
 
 import src.datasets.utils.video.transforms as video_transforms
@@ -143,7 +144,8 @@ class EvalVideoTransform(object):
         self,
         num_views_per_clip=1,
         short_side_size=224,
-        normalize=((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+        normalize=((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),  # 通常使用 ImageNet 的经验值
+                                                                   # 如果是 0-1 范围的张量，这些值能将数据拉回到正态分布附近
     ):
         self.views_per_clip = num_views_per_clip
         self.short_side_size = short_side_size
@@ -196,3 +198,63 @@ def tensor_normalize(tensor, mean, std):
     tensor = tensor - mean
     tensor = tensor / std
     return tensor
+
+
+@torch.no_grad()
+def project_query_token(query_param: nn.Parameter, radius: float = 1.0, eps: float = 1e-8):
+    """
+    将可学习query token投影到半径r的球面  (抑制“范数爆、softmax 变尖锐”)
+
+    通常在 optimizer.step() 之后调用
+
+    Args:
+        query_param: 可学习参数，形状支持 [D], [1, D], [B, D], [1, 1, D], [B, 1, D]
+        radius: 球面半径，默认1.0 ， 推荐0.5-2.0范围
+        eps: 数值稳定性参数，防止除零
+    """
+    # 参数验证
+    if not isinstance(query_param, nn.Parameter):
+        raise TypeError("query_param must be a nn.Parameter")
+
+    if radius <= 0:
+        raise ValueError("radius must be positive")
+
+    q = query_param.data
+
+    # 计算范数
+    norm = q.norm(dim=-1, keepdim=True)
+
+    # 只在需要时进行投影（避免不必要的计算）
+    if (norm > radius).any():
+        scale = radius / norm.clamp(min=eps)
+        scale = torch.where(norm > radius, scale, torch.ones_like(scale))
+        query_param.data.mul_(scale)
+
+
+def load_encoder_from_wrapper(encoder_model, checkpoint_path):
+    """
+    encoder_model: 你新实例化的独立 Encoder 对象
+    checkpoint_path: 保存的权重文件路径 (通常是 model_states.pt)
+    """
+    # 1. 加载原始 state_dict
+    full_state_dict = torch.load(checkpoint_path, map_location='cpu')
+
+    # 如果是 DeepSpeed 保存的，真正的 state_dict 可能在 'module' 或 'model' 键下
+    if 'module' in full_state_dict:
+        full_state_dict = full_state_dict['module']
+
+    # 2. 过滤并重命名 key
+    # 目标：将 "encoder.backbone.xxx" 转换为 "backbone.xxx"
+    encoder_state_dict = {}
+    prefix = 'encoder.'
+
+    for k, v in full_state_dict.items():
+        if k.startswith(prefix):
+            new_key = k[len(prefix):]  # 移除 "encoder." 前缀
+            encoder_state_dict[new_key] = v
+
+    # 3. 加载到独立的 encoder 中
+    msg = encoder_model.load_state_dict(encoder_state_dict, strict=True)
+    print(f"Encoder loaded with message: {msg}")
+
+    return encoder_model

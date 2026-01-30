@@ -15,5 +15,5 @@ def main(eval_name, args_eval, resume_preempt=False):
     if eval_name.startswith("app."):
         import_path = f"{eval_name}.eval"
     else:
-        import_path = f"evals.{eval_name}.eval"
+        import_path = f"evals.{eval_name}.eval_gpus"
     return importlib.import_module(import_path).main(args_eval=args_eval, resume_preempt=resume_preempt)

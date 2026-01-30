@@ -24,6 +24,9 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
+import torch.distributed as dist
+import gc
+from torch.utils.tensorboard import SummaryWriter
 
 from evals.video_classification_frozen.models import init_module
 from evals.video_classification_frozen.utils import make_transforms
@@ -32,6 +35,9 @@ from src.models.attentive_pooler import AttentiveClassifier
 from src.utils.checkpoint_loader import robust_checkpoint_loader
 from src.utils.distributed import AllReduce, init_distributed
 from src.utils.logging import AverageMeter, CSVLogger
+from src.utils.gradient_monitor import GradientMonitor
+from evals.video_classification_frozen.utils import project_query_token
+
 
 logging.basicConfig()
 logger = logging.getLogger()
@@ -60,7 +66,7 @@ def main(args_eval, resume_preempt=False):
     pretrain_folder = args_eval.get("folder", None)
     resume_checkpoint = args_eval.get("resume_checkpoint", False) or resume_preempt
     eval_tag = args_eval.get("tag", None)
-    num_workers = args_eval.get("num_workers", 12)
+    num_workers = args_eval.get("num_workers")
 
     # -- PRETRAIN
     args_pretrain = args_eval.get("model_kwargs")
@@ -93,16 +99,39 @@ def main(args_eval, resume_preempt=False):
     # -- OPTIMIZATION
     args_opt = args_exp.get("optimization")
     batch_size = args_opt.get("batch_size")
+    accumulation_steps = args_opt.get("accumulation_steps")
     num_epochs = args_opt.get("num_epochs")
     use_bfloat16 = args_opt.get("use_bfloat16")
+    # opt_kwargs = [
+    #     dict(
+    #         ref_wd=kwargs.get("weight_decay"),
+    #         final_wd=kwargs.get("final_weight_decay"),
+    #         start_lr=kwargs.get("start_lr"),
+    #         ref_lr=kwargs.get("lr"),
+    #         final_lr=kwargs.get("final_lr"),
+    #         warmup=kwargs.get("warmup"),
+    #     )
+    #     for kwargs in args_opt.get("multihead_kwargs")
+    # ]
+
     opt_kwargs = [
         dict(
-            ref_wd=kwargs.get("weight_decay"),
-            final_wd=kwargs.get("final_weight_decay"),
-            start_lr=kwargs.get("start_lr"),
-            ref_lr=kwargs.get("lr"),
-            final_lr=kwargs.get("final_lr"),
+            base_start_lr=kwargs.get("base_start_lr"),
+            base_ref_lr=kwargs.get("base_ref_lr"),
+            base_final_lr=kwargs.get("base_final_lr"),
+            cross_start_lr=kwargs.get("cross_start_lr"),
+            cross_ref_lr=kwargs.get("cross_ref_lr"),
+            cross_final_lr=kwargs.get("cross_final_lr"),
+            head_start_lr=kwargs.get("head_start_lr"),
+            head_ref_lr=kwargs.get("head_ref_lr"),
+            head_final_lr=kwargs.get("head_final_lr"),
+            base_ref_wd=kwargs.get("base_ref_wd"),
+            base_final_wd=kwargs.get("base_final_wd"),
+            cross_ref_wd=kwargs.get("cross_ref_wd"),
+            cross_final_wd=kwargs.get("cross_final_wd"),
             warmup=kwargs.get("warmup"),
+            head_keywords=kwargs.get("head_keywords"),
+            cross_keywords=kwargs.get("cross_keywords"),
         )
         for kwargs in args_opt.get("multihead_kwargs")
     ]
@@ -133,11 +162,12 @@ def main(args_eval, resume_preempt=False):
 
     # -- make csv_logger
     if rank == 0:
-        csv_logger = CSVLogger(log_file, ("%d", "epoch"), ("%.5f", "loss"), ("%.5f", "acc"))
+        csv_logger = CSVLogger(log_file, ("%d", "epoch"), ("%d", "iter"), ("%.5f", "train_loss1"),
+                               ("%.5f", "train_loss2"), ("%.5f", "acc_max"), ("%.5f", "acc_min"), ("%.2e", "mem"))
 
     # Initialize model
 
-    # -- init models
+    # -- init models  初始化模型参数，权重冻结
     encoder = init_module(
         module_name=module_name,
         frames_per_clip=frames_per_clip,
@@ -199,13 +229,25 @@ def main(args_eval, resume_preempt=False):
     logger.info(f"Dataloader created... iterations per epoch: {ipe}")
 
     # -- optimizer and scheduler
-    optimizer, scaler, scheduler, wd_scheduler = init_opt(
+    # optimizer, scaler, scheduler, wd_scheduler = init_opt(
+    #     classifiers=classifiers,
+    #     opt_kwargs=opt_kwargs,
+    #     iterations_per_epoch=ipe,
+    #     num_epochs=num_epochs,
+    #     use_bfloat16=use_bfloat16,
+    #     accumulation_steps=accumulation_steps,
+    # )
+
+    optimizer, scaler, scheduler, wd_scheduler = init_group_opt(
         classifiers=classifiers,
         opt_kwargs=opt_kwargs,
         iterations_per_epoch=ipe,
         num_epochs=num_epochs,
         use_bfloat16=use_bfloat16,
+        accumulation_steps=accumulation_steps,
     )
+
+
 
     # -- load training checkpoint
     start_epoch = 0
@@ -243,8 +285,9 @@ def main(args_eval, resume_preempt=False):
         train_sampler.set_epoch(epoch)
         if val_only:
             train_acc = -1.0
+            train_losses = [-1.0, -1.0]
         else:
-            train_acc = run_one_epoch(
+            train_acc, train_losses = run_one_epoch(
                 device=device,
                 training=True,
                 encoder=encoder,
@@ -255,9 +298,16 @@ def main(args_eval, resume_preempt=False):
                 wd_scheduler=wd_scheduler,
                 data_loader=train_loader,
                 use_bfloat16=use_bfloat16,
+                accumulation_steps=accumulation_steps,
+                rank=rank,
+                epoch=epoch,
+                csv_logger=csv_logger,
+                folder=folder,
             )
 
-        val_acc = run_one_epoch(
+        save_checkpoint(epoch + 1)
+
+        val_acc, _ = run_one_epoch(
             device=device,
             training=False,
             encoder=encoder,
@@ -268,16 +318,20 @@ def main(args_eval, resume_preempt=False):
             wd_scheduler=wd_scheduler,
             data_loader=val_loader,
             use_bfloat16=use_bfloat16,
+            accumulation_steps=accumulation_steps,
+            rank=rank,
+            epoch=epoch,
+            csv_logger=csv_logger,
+            folder=folder,
         )
 
-        logger.info("[%5d] train: %.3f%% test: %.3f%%" % (epoch + 1, train_acc, val_acc))
-        if rank == 0:
-            csv_logger.log(epoch + 1, train_acc, val_acc)
+        logger.info("[%5d] train_loss: [%.3f %.3f] train_acc: %.3f test_acc: %.3f%%"
+                    % (epoch + 1, train_losses[0], train_losses[1], train_acc, val_acc))
+        # if rank == 0:
+        #     csv_logger.log(epoch + 1, train_losses[0][0], train_losses[1][0], train_acc, val_acc)
 
         if val_only:
             return
-
-        save_checkpoint(epoch + 1)
 
 
 def run_one_epoch(
@@ -291,19 +345,33 @@ def run_one_epoch(
     wd_scheduler,
     data_loader,
     use_bfloat16,
+    accumulation_steps,
+    rank,
+    epoch,
+    csv_logger,
+    folder,
 ):
+    # 监控梯度统计量
+    log_dir = os.path.join(folder, "gradient_monitor")
+    writer = [SummaryWriter(log_dir=os.path.join(log_dir, f"classifier_{i}")) for i in range(len(classifiers))] # TensorBoard日志目录
+    grad_monitor = [GradientMonitor(c, writer[i]) for i, c in enumerate(classifiers)]
 
     for c in classifiers:
         c.train(mode=training)
 
-    criterion = torch.nn.CrossEntropyLoss()
+    criterion = torch.nn.CrossEntropyLoss(reduction="mean", label_smoothing=0.05)  # 为了平滑梯度，减少梯度尖峰 而添加
     top1_meters = [AverageMeter() for _ in classifiers]
+    ipe = len(data_loader)
     for itr, data in enumerate(data_loader):
-        if training:
-            [s.step() for s in scheduler]
-            [wds.step() for wds in wd_scheduler]
+        # 如果是eval, 只验证500步
+        if training is False and itr > 500:
+            break
 
-        with torch.cuda.amp.autocast(dtype=torch.float16, enabled=use_bfloat16):
+        # if training:
+        #     [s.step() for s in scheduler]
+        #     [wds.step() for wds in wd_scheduler]
+
+        with torch.amp.autocast('cuda', dtype=torch.float16, enabled=use_bfloat16):
             # Load data and put on GPU
             clips = [
                 [dij.to(device, non_blocking=True) for dij in di]  # iterate over spatial views of clip
@@ -315,14 +383,78 @@ def run_one_epoch(
 
             # Forward and prediction
             with torch.no_grad():
-                outputs = encoder(clips, clip_indices)
+                outputs = encoder(clips, clip_indices)  # list[tensor(B, N, C)], N = T*H*W
+                # print("outputs", len(outputs))  # 1
+                # print("outputs[0]", outputs[0].size())  # torch.Size([10, 3136, 768])
+                if (itr + 1) % 1000 == 0:
+                    print(f"encoder outputs norm: {outputs[0].norm(p=2, dim=-1).mean(dim=-1).mean().item():.4f}")
+                    print(f"encoder outputs std: {outputs[0].std().item():.4f}")
+                    print(f"encoder outputs mean: {outputs[0].mean().item():.4f}")
                 if not training:
-                    outputs = [[c(o) for o in outputs] for c in classifiers]
+                    outputs = [[c(o) for o in outputs] for c in classifiers]  # list[list[tensor]] , tensor:(B, num_class)
             if training:
-                outputs = [[c(o) for o in outputs] for c in classifiers]
+                outputs = [[c(o) for o in outputs] for c in classifiers]   # list[list[tensor]] , tensor:(B, num_class)
+            # print("output[0] len:", len(outputs[0]))  # 1
+            # print("output[1] len:", len(outputs[1]))  # 1
+            # print("output[0][0].size:", outputs[0][0].size())  #  torch.Size([10, 174])
 
-        # Compute loss
-        losses = [[criterion(o, labels) for o in coutputs] for coutputs in outputs]
+            # Compute loss
+            # losses = [[criterion(o, labels) for o in coutputs] for coutputs in outputs]
+            losses = [[criterion(o, labels) for o in coutputs] for coutputs in outputs]  # [[1], [1]]
+            # print("losses before accumlation : ", losses)
+            losses = [[los/accumulation_steps for los in loss] for loss in losses]
+            # print("losses after accumlation : ", losses)
+
+        if training:
+            if use_bfloat16:
+                [[s.scale(lij).backward() for lij in li] for s, li in zip(scaler, losses)]
+                # [s.step(o) for s, o in zip(scaler, optimizer)
+                # # 梯度自适应剪裁
+                # [g.adaptive_gradient_clipping() for g in grad_monitor]
+
+                if (itr + 1) % accumulation_steps == 0:
+                    [s.unscale_(o) for s, o in zip(scaler, optimizer)]
+                    # [torch.nn.utils.clip_grad_norm_(c.parameters(), max_norm=0.5) for c in classifiers]
+                    # # 梯度自适应剪裁
+                    # [g.adaptive_gradient_clipping() for g in grad_monitor]
+                    # 监控梯度/权重统计量
+                    if (itr + 1) % 1000 == 0:
+                        [g.print_summary() for g in grad_monitor]
+                        [g.log_to_tensorboard(epoch * ipe + itr) for g in grad_monitor]
+                    else:
+                        [g.log_to_tensorboard(epoch * ipe + itr) for g in grad_monitor]
+                    [s.step(o) for s, o in zip(scaler, optimizer)]
+                    [s.update() for s in scaler]
+            else:
+                [[lij.backward() for lij in li] for li in losses]
+                # [o.step() for o in optimizer]
+                # [torch.nn.utils.clip_grad_norm_(c.parameters(), max_norm=5) for c in classifiers]
+                # # 梯度自适应剪裁
+                # [g.adaptive_gradient_clipping() for g in grad_monitor]
+                if (itr + 1) % accumulation_steps == 0:
+                    # [s.unscale_(o) for s, o in zip(scaler, optimizer)]
+                    # [torch.nn.utils.clip_grad_norm_(c.parameters(), max_norm=0.5) for c in classifiers]
+                    # # 梯度自适应剪裁
+                    # [g.adaptive_gradient_clipping() for g in grad_monitor]
+                    # 监控梯度/权重统计量
+                    if (itr + 1) % 1000 == 0:
+                        [g.print_summary() for g in grad_monitor]
+                        [g.log_to_tensorboard(epoch * ipe + itr) for g in grad_monitor]
+                    else:
+                        [g.log_to_tensorboard(epoch * ipe + itr) for g in grad_monitor]
+                    # # 梯度自适应剪裁
+                    # [g.adaptive_gradient_clipping() for g in grad_monitor]
+                    [o.step() for o in optimizer]
+            if (itr + 1) % accumulation_steps == 0:
+                # 可学习 query token L2范数约束， 抑制“范数爆、softmax 变尖锐”
+                [project_query_token(c.module.pooler.query_tokens, 0.5) for c in classifiers]
+                [s.step() for s in scheduler]
+                [wds.step() for wds in wd_scheduler]
+                [o.zero_grad() for o in optimizer]
+            # [o.zero_grad() for o in optimizer]
+
+        losses_log = [loss[0].detach().item() * accumulation_steps for loss in losses]
+        # print("losses_log : ", losses_log)
         with torch.no_grad():
             outputs = [sum([F.softmax(o, dim=1) for o in coutputs]) / len(coutputs) for coutputs in outputs]
             top1_accs = [100.0 * coutputs.max(dim=1).indices.eq(labels).sum() / batch_size for coutputs in outputs]
@@ -330,30 +462,49 @@ def run_one_epoch(
             for t1m, t1a in zip(top1_meters, top1_accs):
                 t1m.update(t1a)
 
-        if training:
-            if use_bfloat16:
-                [[s.scale(lij).backward() for lij in li] for s, li in zip(scaler, losses)]
-                [s.step(o) for s, o in zip(scaler, optimizer)]
-                [s.update() for s in scaler]
-            else:
-                [[lij.backward() for lij in li] for li in losses]
-                [o.step() for o in optimizer]
-            [o.zero_grad() for o in optimizer]
-
         _agg_top1 = np.array([t1m.avg for t1m in top1_meters])
+        _acc_top1 = np.array([t1m.val for t1m in top1_meters])
+        # print("losses[0] size :", len(losses[0]))  # 1
         if itr % 10 == 0:
             logger.info(
-                "[%5d] %.3f%% [%.3f%% %.3f%%] [mem: %.2e]"
+                "[%5d] [%.3f%% %.3f%%] %.3f%% [%.3f%% %.3f%%] [losses: %.3f %.3f] [mem: %.2e] [%.3f%% %.3f%%]"
                 % (
                     itr,
+                    _agg_top1[0],
+                    _agg_top1[1],
                     _agg_top1.max(),
                     _agg_top1.mean(),
                     _agg_top1.min(),
+                    losses_log[0],
+                    losses_log[1],
                     torch.cuda.max_memory_allocated() / 1024.0**2,
+                    _acc_top1[0],
+                    _acc_top1[1],
                 )
             )
+            if rank == 0:
+                csv_logger.log(epoch, itr, losses_log[0], losses_log[1],
+                               _agg_top1.max(), _agg_top1.min(), torch.cuda.max_memory_allocated() / 1024.0**2)
 
-    return _agg_top1.max()
+    # 本次epoch结束，如果有剩余梯度，强制更新
+    if training:
+        if ipe % accumulation_steps != 0:
+            # 监控梯度/权重统计量
+            [g.print_summary() for g in grad_monitor]
+            [g.log_to_tensorboard((epoch + 1) * ipe) for g in grad_monitor]
+            if use_bfloat16:
+                [s.step(o) for s, o in zip(scaler, optimizer)]
+                [s.update() for s in scaler]
+            else:
+                [o.step() for o in optimizer]
+            # 可学习 query token L2范数约束， 抑制“范数爆、softmax 变尖锐”
+            [project_query_token(c.module.pooler.query_tokens, 0.5) for c in classifiers]
+            [s.step() for s in scheduler]
+            [wds.step() for wds in wd_scheduler]
+            [o.zero_grad() for o in optimizer]
+
+    [w.close() for w in writer]
+    return _agg_top1.max(), losses_log
 
 
 def load_checkpoint(device, r_path, classifiers, opt, scaler, val_only=False):
@@ -462,16 +613,26 @@ def make_dataloader(
         drop_last=False,
         subset_file=subset_file,
     )
+
+    # 防止内存泄漏 (原代码没有)
+    # try:
+    #     yield data_loader, data_sampler
+    # finally:
+    #     del data_loader
+    #     gc.collect()
+    #     if torch.cuda.is_available():
+    #         torch.cuda.empty_cache()
+
     return data_loader, data_sampler
 
 
-def init_opt(classifiers, iterations_per_epoch, opt_kwargs, num_epochs, use_bfloat16=False):
+def init_opt(classifiers, iterations_per_epoch, accumulation_steps, opt_kwargs, num_epochs, use_bfloat16=False):
     optimizers, schedulers, wd_schedulers, scalers = [], [], [], []
     for c, kwargs in zip(classifiers, opt_kwargs):
         param_groups = [
             {
                 "params": (p for n, p in c.named_parameters()),
-                "mc_warmup_steps": int(kwargs.get("warmup") * iterations_per_epoch),
+                "mc_warmup_steps": int(kwargs.get("warmup") * (iterations_per_epoch / accumulation_steps)),
                 "mc_start_lr": kwargs.get("start_lr"),
                 "mc_ref_lr": kwargs.get("ref_lr"),
                 "mc_final_lr": kwargs.get("final_lr"),
@@ -481,10 +642,135 @@ def init_opt(classifiers, iterations_per_epoch, opt_kwargs, num_epochs, use_bflo
         ]
         logger.info("Using AdamW")
         optimizers += [torch.optim.AdamW(param_groups)]
-        schedulers += [WarmupCosineLRSchedule(optimizers[-1], T_max=int(num_epochs * iterations_per_epoch))]
-        wd_schedulers += [CosineWDSchedule(optimizers[-1], T_max=int(num_epochs * iterations_per_epoch))]
-        scalers += [torch.cuda.amp.GradScaler() if use_bfloat16 else None]
+        schedulers += [WarmupCosineLRSchedule(optimizers[-1], T_max=int(num_epochs * (iterations_per_epoch / accumulation_steps)))]
+        wd_schedulers += [CosineWDSchedule(optimizers[-1], T_max=int(num_epochs * (iterations_per_epoch / accumulation_steps)))]
+        scalers += [torch.amp.GradScaler("cuda") if use_bfloat16 else None]
     return optimizers, scalers, schedulers, wd_schedulers
+
+
+def init_group_opt(classifiers, iterations_per_epoch, accumulation_steps, opt_kwargs, num_epochs, use_bfloat16=False):
+    optimizers, schedulers, wd_schedulers, scalers = [], [], [], []
+    for c, kwargs in zip(classifiers, opt_kwargs):
+
+        param_groups = param_groups_no_wd(
+            model=c,
+            base_start_lr=kwargs.get("base_start_lr"),
+            base_ref_lr=kwargs.get("base_ref_lr"),
+            base_final_lr=kwargs.get("base_final_lr"),
+            cross_start_lr=kwargs.get("cross_start_lr"),
+            cross_ref_lr=kwargs.get("cross_ref_lr"),
+            cross_final_lr=kwargs.get("cross_final_lr"),
+            head_start_lr=kwargs.get("head_start_lr"),
+            head_ref_lr=kwargs.get("head_ref_lr"),
+            head_final_lr=kwargs.get("head_final_lr"),
+            base_ref_wd=kwargs.get("base_ref_wd"),
+            base_final_wd=kwargs.get("base_final_wd"),
+            cross_ref_wd=kwargs.get("cross_ref_wd"),
+            cross_final_wd=kwargs.get("cross_final_wd"),
+            mc_warmup_steps=int(kwargs.get("warmup") * (iterations_per_epoch / accumulation_steps)),
+            head_keywords=kwargs.get("head_keywords"),
+            cross_keywords=kwargs.get("cross_keywords"),
+        )
+
+        logger.info("Using AdamW...")
+        optimizers += [torch.optim.AdamW(param_groups)]
+        schedulers += [WarmupCosineLRSchedule(optimizers[-1], T_max=int(num_epochs * (iterations_per_epoch / accumulation_steps)))]
+        wd_schedulers += [CosineWDSchedule(optimizers[-1], T_max=int(num_epochs * (iterations_per_epoch / accumulation_steps)))]
+        scalers += [torch.amp.GradScaler("cuda") if use_bfloat16 else None]
+    return optimizers, scalers, schedulers, wd_schedulers
+
+
+def param_groups_no_wd(model,
+                       base_start_lr, base_ref_lr, base_final_lr,
+                       cross_start_lr, cross_ref_lr, cross_final_lr,
+                       head_start_lr, head_ref_lr, head_final_lr,
+                       base_ref_wd, base_final_wd,
+                       cross_ref_wd, cross_final_wd,
+                       head_ref_wd=0.0, head_final_wd=0.0,
+                       mc_warmup_steps=0.0,
+                       head_keywords=None, cross_keywords=None, ln_keywords=None,
+                       verbose=2):
+    """
+    智能参数分组，支持不同的学习率和权重衰减
+
+    Args:
+        model: 神经网络模型
+        base_lr: 基础学习率
+        head_lr: 分类头学习率
+        cross_lr: 交叉注意力学习率
+        wd: 权重衰减系数
+        head_keywords: 分类头参数关键词
+        cross_keywords: 交叉注意力参数关键词
+        ln_keywords: LayerNorm参数关键词
+        verbose: 是否打印分组信息
+    """
+    # 默认关键词
+    if head_keywords is None:
+        head_keywords = ["head", "classifier", "fc", "linear_out", "proj"]
+    if cross_keywords is None:
+        cross_keywords = ["cross", "cross_attn", "cross_block", "xfm"]
+    if ln_keywords is None:
+        ln_keywords = ["ln", "layernorm", "norm"]
+
+    groups = {
+        'decay': [], 'no_decay': [], 'cross_params': [], 'head_params': []
+    }
+    group_names = {key: [] for key in groups.keys()}
+
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+
+        is_bias = n.endswith(".bias")
+        is_ln = any(keyword in n.lower() for keyword in ln_keywords)
+        is_ln_or_bias = is_bias or is_ln
+
+        is_cross = any(keyword in n.lower() for keyword in cross_keywords)
+        is_head = any(keyword in n.lower() for keyword in head_keywords)
+
+        if is_head:
+            groups['head_params'].append(p)
+            group_names['head_params'].append(n)
+        elif is_cross:
+            groups['cross_params'].append(p)
+            group_names['cross_params'].append(n)
+        elif is_ln_or_bias:
+            groups['no_decay'].append(p)
+            group_names['no_decay'].append(n)
+        else:
+            groups['decay'].append(p)
+            group_names['decay'].append(n)
+
+    # 打印分组信息
+    if verbose:
+        print("=" * 50)
+        print("Parameter Grouping Summary:")
+        print("=" * 50)
+        for group_name in groups:
+            count = len(groups[group_name])
+            print(f"{group_name:15s}: {count:4d} parameters")
+
+        if verbose > 1:  # 详细模式
+            for group_name, names in group_names.items():
+                if names:
+                    print(f"\n{group_name}:")
+                    for name in sorted(names):
+                        print(f"  {name}")
+
+    return [
+        {"params": groups['decay'], "group_name": 'base',
+         "base_start_lr": base_start_lr, "base_ref_lr": base_ref_lr, "base_final_lr": base_final_lr,
+         "base_ref_wd": base_ref_wd, "base_final_wd": base_final_wd, "mc_warmup_steps": mc_warmup_steps},
+        {"params": groups['no_decay'], "group_name": 'no_decay',
+         "base_start_lr": base_start_lr, "base_ref_lr": base_ref_lr, "base_final_lr": base_final_lr,
+         "weight_decay": 0.0, "mc_warmup_steps": mc_warmup_steps},
+        {"params": groups['cross_params'], "group_name": 'cross',
+         "cross_start_lr": cross_start_lr, "cross_ref_lr": cross_ref_lr, "cross_final_lr": cross_final_lr,
+         "cross_ref_wd": cross_ref_wd, "cross_final_wd": cross_final_wd, "mc_warmup_steps": mc_warmup_steps},
+        {"params": groups['head_params'], "group_name": 'head',
+         "head_start_lr": head_start_lr, "head_ref_lr": head_ref_lr, "head_final_lr": head_final_lr,
+         "head_ref_wd": head_ref_wd, "head_final_wd": head_final_wd, "mc_warmup_steps": mc_warmup_steps}
+    ]
 
 
 class WarmupCosineLRSchedule(object):
@@ -497,9 +783,12 @@ class WarmupCosineLRSchedule(object):
     def step(self):
         self._step += 1
         for group in self.optimizer.param_groups:
-            ref_lr = group.get("mc_ref_lr")
-            final_lr = group.get("mc_final_lr")
-            start_lr = group.get("mc_start_lr")
+            prefix = group.get('group_name')
+            if prefix == 'no_decay':
+                prefix = 'base'
+            ref_lr = group.get(prefix + '_ref_lr')
+            final_lr = group.get(prefix + '_final_lr')
+            start_lr = group.get(prefix + '_start_lr')
             warmup_steps = group.get("mc_warmup_steps")
             T_max = self.T_max - warmup_steps
             if self._step < warmup_steps:
@@ -527,8 +816,13 @@ class CosineWDSchedule(object):
         progress = self._step / self.T_max
 
         for group in self.optimizer.param_groups:
-            ref_wd = group.get("mc_ref_wd")
-            final_wd = group.get("mc_final_wd")
+            prefix = group.get('group_name')
+            if prefix == 'no_decay':
+                ref_wd = 0
+                final_wd = 0
+            else:
+                ref_wd = group.get(prefix + '_ref_wd')
+                final_wd = group.get(prefix + '_final_wd')
             new_wd = final_wd + (ref_wd - final_wd) * 0.5 * (1.0 + math.cos(math.pi * progress))
             if final_wd <= ref_wd:
                 new_wd = max(final_wd, new_wd)

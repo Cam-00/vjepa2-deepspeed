@@ -17,6 +17,7 @@ def get_3d_sincos_pos_embed(embed_dim, grid_size, grid_depth, cls_token=False, u
     grid_d = np.arange(grid_depth, dtype=float)
     grid_h = np.arange(grid_size, dtype=float)
     grid_w = np.arange(grid_size, dtype=float)
+    # grid_h, grid_d, grid_w 的shape is same: [d,h,w]
     grid_h, grid_d, grid_w = np.meshgrid(
         grid_h, grid_d, grid_w
     )  # order of meshgrid is very important for indexing as [d,h,w]
@@ -31,10 +32,10 @@ def get_3d_sincos_pos_embed(embed_dim, grid_size, grid_depth, cls_token=False, u
     emb_h = get_1d_sincos_pos_embed_from_grid(h_embed_dim, grid_h)  # (T*H*W, D1)
     emb_w = get_1d_sincos_pos_embed_from_grid(w_embed_dim, grid_w)  # (T*H*W, D2)
     emb_d = get_1d_sincos_pos_embed_from_grid(d_embed_dim, grid_d)  # (T*H*W, D3)
-    pos_embed = np.concatenate([emb_d, emb_h, emb_w], axis=1)
+    pos_embed = np.concatenate([emb_d, emb_h, emb_w], axis=1)  # (T*H*W, D1+D2+D3)
     pos_embed = pos_embed[:, :embed_dim]
-    if cls_token:
-        pos_embed = np.concatenate([np.zeros([1, embed_dim]), pos_embed], axis=0)
+    if cls_token:   # Add a class token embedding to the first row of pos_embed
+        pos_embed = np.concatenate([np.zeros([1, embed_dim]), pos_embed], axis=0)  # (1+T*H*W, D1+D2+D3)
     return pos_embed
 
 
@@ -75,15 +76,16 @@ def get_1d_sincos_pos_embed(embed_dim, grid_size, cls_token=False):
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     """
     embed_dim: output dimension for each position
-    pos: a list of positions to be encoded: size (M,)
+    pos: a list of positions to be encoded: size (M,), eg. (T, H, W)
     returns: (M, D)
     """
     assert embed_dim % 2 == 0
     omega = np.arange(embed_dim // 2, dtype=float)
     omega /= embed_dim / 2.0
-    omega = 1.0 / 10000**omega  # (D/2,)
 
-    pos = pos.reshape(-1)  # (M,)
+    omega = 1.0 / 10000**omega  # (D/2,)  # RoPE paper: θ
+
+    pos = pos.reshape(-1)  # (M,) , M = T * H * W
     out = np.einsum("m,d->md", pos, omega)  # (M, D/2), outer product
 
     emb_sin = np.sin(out)  # (M, D/2)

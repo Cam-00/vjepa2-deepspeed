@@ -9,7 +9,7 @@ import math
 import torch
 import torch.nn as nn
 
-from src.models.utils.modules import Block, CrossAttention, CrossAttentionBlock
+from src.models.utils.modules import Block, CrossAttention, CrossAttentionBlock, CrossAttentionBlockPatched
 from src.utils.tensors import trunc_normal_
 
 
@@ -31,13 +31,18 @@ class AttentivePooler(nn.Module):
     ):
         super().__init__()
         self.use_activation_checkpointing = use_activation_checkpointing
-        self.query_tokens = nn.Parameter(torch.zeros(1, num_queries, embed_dim))
+
+        self.query_tokens = nn.Parameter(torch.zeros(1, num_queries, embed_dim))  # （1, 1, D）
 
         self.complete_block = complete_block
         if complete_block:
             self.cross_attention_block = CrossAttentionBlock(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, norm_layer=norm_layer
             )
+            # self.cross_attention_block = CrossAttentionBlockPatched(
+            #     dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias,
+            #     norm_layer=norm_layer, use_cosine_qk=False, tau=0.5, init_alpha_attn=0.05, init_alpha_mlp=0.05
+            # )
         else:
             self.cross_attention_block = CrossAttention(dim=embed_dim, num_heads=num_heads, qkv_bias=qkv_bias)
 
@@ -57,6 +62,7 @@ class AttentivePooler(nn.Module):
                 ]
             )
 
+        self.norm = norm_layer(embed_dim)
         self.init_std = init_std
         trunc_normal_(self.query_tokens, std=self.init_std)
         self.apply(self._init_weights)
@@ -67,6 +73,7 @@ class AttentivePooler(nn.Module):
             param.div_(math.sqrt(2.0 * layer_id))
 
         layer_id = 0
+
         if self.blocks is not None:
             for layer_id, layer in enumerate(self.blocks):
                 rescale(layer.attn.proj.weight.data, layer_id + 1)
@@ -94,9 +101,12 @@ class AttentivePooler(nn.Module):
                 if self.use_activation_checkpointing:
                     x = torch.utils.checkpoint.checkpoint(blk, x, False, None, use_reentrant=False)
                 else:
-                    x = blk(x)
-        q = self.query_tokens.repeat(len(x), 1, 1)
-        q = self.cross_attention_block(q, x)
+                    x = blk(x)   # (B, N, C)
+        q = self.query_tokens.repeat(len(x), 1, 1)   # (B, 1, D)
+
+        # q = q / torch.norm(q, p=2, dim=-1, keepdim=True).clamp(min=1e-6)
+        # q = self.cross_attention_block(q, x, return_attn_stats=False)  # (B, 1, D)
+        q = self.cross_attention_block(q, x)   # (B, 1, D)
         return q
 
 
@@ -129,7 +139,14 @@ class AttentiveClassifier(nn.Module):
             complete_block=complete_block,
             use_activation_checkpointing=use_activation_checkpointing,
         )
+        # self.norm = norm_layer(embed_dim)
         self.linear = nn.Linear(embed_dim, num_classes, bias=True)
+
+        # Add a linear layer with weight and bias initialization,
+        # as the gradients are too large during classification head training,
+        # causing an excessive gradient-norm to weight-norm ratio.
+        # nn.init.xavier_uniform_(self.linear.weight, gain=0.9)
+        # nn.init.zeros_(self.linear.bias)
 
     def forward(self, x):
         x = self.pooler(x).squeeze(1)

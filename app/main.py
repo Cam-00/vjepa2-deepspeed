@@ -7,9 +7,14 @@ import argparse
 import multiprocessing as mp
 import pprint
 from pathlib import Path
-
+import os
+import sys
 import yaml
-
+import torch
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(current_dir)
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 from app.scaffold import main as app_main
 from src.utils.distributed import init_distributed
 
@@ -26,19 +31,82 @@ parser.add_argument(
     "--debugmode",
     type=bool,
     default=False,
-    help="Setting this to true will not spin up new processes. "
-    "The main code runs the main process, which makes it easier to \
-    debug with checkpointing.",
+    help="Setting this to true will not spin up new processes."
 )
 
+#  -- add DeepSpeed config
+parser.add_argument("--deepspeed", action='store_true', help='enable DeepSpeed')
+parser.add_argument('--deepspeed_config', type=str, default='ds_config.json',
+                    help='DeepSpeed config file')
+parser.add_argument('--local_rank', type=int, default=-1,
+                    help='local rank passed from distributed launcher')
 
-def process_main(rank, fname, world_size, devices):
+
+def deepspeed_main(fname, devices, deepspeed_config_path):
+    """
+    DeepSpeed multiprocessing start method
+    """
+    import logging
+    from src.utils.logging import get_logger
+
+    rank = int(os.environ.get('RANK', 0))
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    world_size = int(os.environ.get('WORLD_SIZE', 1))
+
+    # -- setting CUDA device
+    if devices and len(devices) > 0:
+        if local_rank < len(devices):
+            device_id = devices[local_rank].split(":")[-1]
+            os.environ["CUDA_VISIBLE_DEVICES"] = device_id
+            torch.cuda.set_device(int(device_id))
+
+    # -- setting log
+    logger = get_logger(force=True)
+    if rank == 0:
+        logger.setLevel(logging.INFO)
+    else:
+        logger.setLevel(logging.WARNING)
+
+    logger.info(f"DeepSpeed mode - called-params {fname}")
+
+    # -- load model config(.yaml)
+    params = None
+    with open(fname, "r") as y_file:
+        params = yaml.load(y_file, Loader=yaml.FullLoader)
+        logger.info("loaded params...")
+
+    # -- add deepspeed params to args
+    params['deepspeed'] = True
+    params['deepspeed_config'] = deepspeed_config_path
+    params['local_rank'] = local_rank
+    params['world_size'] = world_size
+    params['rank'] = rank
+    params['devices'] = devices
+
+    # only log config on rank 0
+    if rank == 0:
+        pprint.PrettyPrinter(indent=4).pprint(params)
+        folder = params["folder"]
+        params_path = os.path.join(folder, "params-pretrain.yaml")
+        folder = Path(folder)
+        folder.mkdir(parents=True, exist_ok=True)
+        with open(params_path, "w") as f:
+            yaml.dump(params, f)
+
+    logger.info(f"Running with DeepSpeed... (rank: {rank}/{world_size})")
+
+    # Initialize app, transfer all params including model config and deepspeed config
+    app_main(params["app"], args=params)
+
+
+def original_main(rank, fname, world_size, devices):
+    """
+    Legacy multiprocessing start method
+    """
     import os
-
     os.environ["CUDA_VISIBLE_DEVICES"] = str(devices[rank].split(":")[-1])
 
     import logging
-
     from src.utils.logging import get_logger
 
     logger = get_logger(force=True)
@@ -75,10 +143,21 @@ def process_main(rank, fname, world_size, devices):
 
 if __name__ == "__main__":
     args = parser.parse_args()
-    if args.debugmode:
-        process_main(rank=0, fname=args.fname, world_size=1, devices=["cuda:0"])
+
+    if args.deepspeed:
+        # DeepSpeed mode
+        print(f"Running in DeepSpeed mode with config: {args.deepspeed_config}")
+        deepspeed_main(args.fname, args.devices, args.deepspeed_config)
+
     else:
-        num_gpus = len(args.devices)
-        mp.set_start_method("spawn")
-        for rank in range(num_gpus):
-            mp.Process(target=process_main, args=(rank, args.fname, num_gpus, args.devices)).start()
+        # -- legacy mode
+        if args.debugmode:
+            original_main(rank=0, fname=args.fname, world_size=1, devices=["cuda:0"])
+        else:
+            num_gpus = len(args.devices)
+            mp.set_start_method("spawn")
+            for rank in range(num_gpus):
+                mp.Process(
+                    target=original_main,
+                    args=(rank, args.fname, num_gpus, args.devices)
+                ).start()

@@ -20,46 +20,47 @@ class VisionTransformerPredictor(nn.Module):
 
     def __init__(
         self,
-        img_size=(224, 224),
-        patch_size=16,
-        num_frames=1,
-        tubelet_size=2,
-        embed_dim=768,
-        predictor_embed_dim=384,
-        depth=6,
-        num_heads=12,
-        mlp_ratio=4.0,
-        qkv_bias=True,
-        qk_scale=None,
-        drop_rate=0.0,
-        attn_drop_rate=0.0,
-        drop_path_rate=0.0,
-        norm_layer=nn.LayerNorm,
-        init_std=0.02,
-        uniform_power=False,
-        use_mask_tokens=False,
-        num_mask_tokens=2,
-        zero_init_mask_tokens=True,
-        use_silu=False,
-        wide_silu=True,
-        use_activation_checkpointing=False,
-        return_all_tokens=False,
-        chop_last_n_tokens=0,
-        use_rope=False,
+        img_size=(224, 224),                 # Input image size (height, width)
+        patch_size=16,                       # Patch size
+        num_frames=1,                        # Number of video frames
+        tubelet_size=2,                      # Temporal length of video patch (frames)
+        embed_dim=768,                       # Input token dimension
+        predictor_embed_dim=384,             # Internal predictor dimension (usually smaller than input)
+        depth=6,                             # Number of Transformer blocks
+        num_heads=12,                        # Number of attention heads
+        mlp_ratio=4.0,                       # MLP expansion ratio (hidden dim / input dim). 4.0 is the "golden ratio" for ViT, balancing capacity and efficiency.
+        qkv_bias=True,                       # Use bias in QKV projections
+        qk_scale=None,                       # Scaling factor for attention scores
+        drop_rate=0.0,                       # FFN dropout rate
+        attn_drop_rate=0.0,                  # Attention dropout rate
+        drop_path_rate=0.0,                  # Stochastic depth decay rate
+        norm_layer=nn.LayerNorm,             # Type of normalization layer
+        init_std=0.02,                       # Initialization standard deviation
+        uniform_power=False,                 # Whether to distribute positional encoding energy uniformly
+        use_mask_tokens=False,               # Whether to use mask tokens
+        num_mask_tokens=2,                   # Number of mask types (e.g., short/long-range masks from V-JEPA)
+        zero_init_mask_tokens=True,          # Whether to initialize mask tokens with zeros
+        use_silu=False,                      # Whether to use SiLU activation
+        wide_silu=True,                      # Whether to use wide SiLU variant
+        use_activation_checkpointing=False,  # Enable gradient checkpointing to save memory
+        return_all_tokens=False,             # Whether to return the full sequence of tokens
+        chop_last_n_tokens=0,                # Number of tokens to remove from the end
+        use_rope=False,                      # Whether to use Rotary Positional Embeddings
         **kwargs
     ):
         super().__init__()
         self.return_all_tokens = return_all_tokens
         self.chop_last_n_tokens = chop_last_n_tokens
 
-        # Map input to predictor dimension
+        # Map input to predictor dimension (Dimensionality reduction)
         self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
 
-        # Mask tokens
+        # Initialize mask tokens
         self.mask_tokens = None
         self.num_mask_tokens = 0
         if use_mask_tokens:
             self.num_mask_tokens = num_mask_tokens
+            # Create learnable mask token parameters
             self.mask_tokens = nn.ParameterList(
                 [nn.Parameter(torch.zeros(1, 1, predictor_embed_dim)) for i in range(num_mask_tokens)]
             )
@@ -79,24 +80,29 @@ class VisionTransformerPredictor(nn.Module):
         self.grid_depth = num_frames // self.tubelet_size
         self.use_activation_checkpointing = use_activation_checkpointing
 
+        # Stochastic depth decay rule (different per layer)
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
 
+        # Calculate total number of patches
         if self.is_video:
             self.num_patches = num_patches = (
                 (num_frames // tubelet_size) * (img_size[0] // patch_size) * (img_size[1] // patch_size)
             )
         else:
             self.num_patches = num_patches = (img_size[0] // patch_size) * (img_size[1] // patch_size)
-        # Position embedding
-        self.uniform_power = uniform_power
 
+        # Initialize position embeddings
+        self.uniform_power = uniform_power
         self.predictor_pos_embed = None
         if not use_rope:
+            # Learnable position embeddings
+            # torch.nn.Parameter marks variables as model parameters
+            # requires_grad=False: fixed positional encoding (not updated via gradient descent)
             self.predictor_pos_embed = nn.Parameter(
                 torch.zeros(1, num_patches, predictor_embed_dim), requires_grad=False
-            )
+            )  # (1, N, preD) ,  preD = predictor_embed_dim
 
-        # Attention Blocks
+        # Stack Transformer blocks
         self.use_rope = use_rope
         self.predictor_blocks = nn.ModuleList(
             [
@@ -113,7 +119,7 @@ class VisionTransformerPredictor(nn.Module):
                     act_layer=nn.SiLU if use_silu else nn.GELU,
                     wide_silu=wide_silu,
                     attn_drop=attn_drop_rate,
-                    drop_path=dpr[i],
+                    drop_path=dpr[i],   # Layer-specific drop path rate
                     norm_layer=norm_layer,
                 )
                 for i in range(depth)
@@ -130,15 +136,18 @@ class VisionTransformerPredictor(nn.Module):
         self.init_std = init_std
         if not zero_init_mask_tokens:
             for mt in self.mask_tokens:
+                # Truncated normal distribution is used to keep values within a range,
+                # ensuring stability at the start of training and preventing gradient issues.
                 trunc_normal_(mt, std=init_std)
-        self.apply(self._init_weights)
-        self._rescale_blocks()
+        self.apply(self._init_weights)   # Recursively initialize all linear and norm layers
+        self._rescale_blocks()   # Rescale block weights
 
     def _init_pos_embed(self, pos_embed):
         embed_dim = pos_embed.size(-1)
         grid_size = self.img_height // self.patch_size  # TODO: update; currently assumes square input
         if self.is_video:
             grid_depth = self.num_frames // self.tubelet_size
+            # Rotary pos embed does not include cls token
             sincos = get_3d_sincos_pos_embed(
                 embed_dim, grid_size, grid_depth, cls_token=False, uniform_power=self.uniform_power
             )
@@ -165,9 +174,10 @@ class VisionTransformerPredictor(nn.Module):
 
     def forward(self, x, masks_x, masks_y, mask_index=1, has_cls=False):
         """
-        :param x: context tokens
-        :param masks_x: indices of context tokens in input
-        :params masks_y: indices of target tokens in input
+        :param x: context tokens from encoder, shape is tensor(B, K, D), D is encoder embed dim
+        :param masks_x: indices of context tokens in input , shape is tensor(B, K) (visible patches)
+        :params masks_y: indices of target tokens in input , shape is tensor(B, N - K), N is num_patches (masked patches)
+        :params has_cls: whether input tokens x includes cls token
         """
         assert (masks_x is not None) and (masks_y is not None), "Cannot run predictor without mask indices"
         if not isinstance(masks_x, list):
@@ -178,8 +188,10 @@ class VisionTransformerPredictor(nn.Module):
         # Batch Size
         B = len(x) // len(masks_x)
 
-        # Map context tokens to pedictor dimensions
-        x = self.predictor_embed(x)
+        # Map context tokens to predictor dimensions
+        x = self.predictor_embed(x)  # (B, K, preD)
+
+        # If input x contains cls token, remove it
         if has_cls:
             x_cls = x[:, :1, :]
             x = x[:, 1:, :]
@@ -187,40 +199,41 @@ class VisionTransformerPredictor(nn.Module):
 
         # Add positional embedding to ctxt tokens
         if not self.use_rope:
-            x_pos_embed = self.predictor_pos_embed.repeat(B, 1, 1)
-            x += apply_masks(x_pos_embed, masks_x)
+            x_pos_embed = self.predictor_pos_embed.repeat(B, 1, 1)  # (B, N, preD)
+            x += apply_masks(x_pos_embed, masks_x)  # (B, K, preD)
 
-        # Make target tokens
-        mask_index = mask_index % self.num_mask_tokens
-        pred_tokens = self.mask_tokens[mask_index]
-        pred_tokens = pred_tokens.repeat(B, self.num_patches, 1)
-        pred_tokens = apply_masks(pred_tokens, masks_y)
-        # -- add pos embed
+        # Make target tokens (masked regions)
+        mask_index = mask_index % self.num_mask_tokens  # result is 0 or 1, handles 2 mask types in V-JEPA
+        pred_tokens = self.mask_tokens[mask_index]   # (1, 1, preD)
+        pred_tokens = pred_tokens.repeat(B, self.num_patches, 1)  # (B, N, preD)
+        pred_tokens = apply_masks(pred_tokens, masks_y)           # (B, N - K, preD)
+        # -- add pos embed to target tokens
         if not self.use_rope:
-            pos_embs = self.predictor_pos_embed.repeat(B, 1, 1)
-            pos_embs = apply_masks(pos_embs, masks_y)
-            pos_embs = repeat_interleave_batch(pos_embs, B, repeat=len(masks_x))
-            pred_tokens += pos_embs
+            pos_embs = self.predictor_pos_embed.repeat(B, 1, 1)  # (B, N, preD)
+            pos_embs = apply_masks(pos_embs, masks_y)                   # (B, N - K, preD)
+            pos_embs = repeat_interleave_batch(pos_embs, B, repeat=len(masks_x))  # (B, N - K, preD)
+            pred_tokens += pos_embs   # (B, N - K, preD)
 
         # Concatenate context & target tokens
         x = x.repeat(len(masks_x), 1, 1)
-        x = torch.cat([x, pred_tokens], dim=1)
+        x = torch.cat([x, pred_tokens], dim=1)    # (B, N, preD)
 
         # Positions of context & target tokens
-        masks_x = torch.cat(masks_x, dim=0)
-        masks_y = torch.cat(masks_y, dim=0)
-        masks = torch.cat([masks_x, masks_y], dim=1)
+        masks_x = torch.cat(masks_x, dim=0)  # (B, K)
+        masks_y = torch.cat(masks_y, dim=0)  # (B, N - K)
+        masks = torch.cat([masks_x, masks_y], dim=1)  # (B, N)
 
         # Put tokens in sorted order
-        argsort = torch.argsort(masks, dim=1)  # [B, N]
-        masks = torch.stack([masks[i, row] for i, row in enumerate(argsort)], dim=0)
-        x = torch.stack([x[i, row, :] for i, row in enumerate(argsort)], dim=0)
+        argsort = torch.argsort(masks, dim=1)  # (B, N), returns indices for ascending sort
+        masks = torch.stack([masks[i, row] for i, row in enumerate(argsort)], dim=0)  # Sorted masks
+        x = torch.stack([x[i, row, :] for i, row in enumerate(argsort)], dim=0)  # Sorted x
 
         # Remove the last n tokens of sorted sequence before processing
         if self.chop_last_n_tokens > 0:
             x = x[:, : -self.chop_last_n_tokens]
             masks = masks[:, : -self.chop_last_n_tokens]
 
+        # If input x contained cls token, restore it
         if has_cls:
             x = torch.cat([x_cls, x], dim=1)
 
@@ -230,17 +243,18 @@ class VisionTransformerPredictor(nn.Module):
                 x = torch.utils.checkpoint.checkpoint(blk, x, masks, None, use_reentrant=False)
             else:
                 x = blk(x, mask=masks, attn_mask=None)
-        x = self.predictor_norm(x)
-
+        x = self.predictor_norm(x)  # Layer Normalization
+        # If input x contained cls token, remove it for the output
         if has_cls:
             x = x[:, 1:, :]
 
         # Return output corresponding to target tokens
-        if not self.return_all_tokens:
-            reverse_argsort = torch.argsort(argsort, dim=1)  # [B, N]
+        if not self.return_all_tokens:  # Only return target tokens
+            reverse_argsort = torch.argsort(argsort, dim=1)  # (B, N) get original order
             x = torch.stack([x[i, row, :] for i, row in enumerate(reverse_argsort)], dim=0)
-            x = x[:, N_ctxt:]
+            x = x[:, N_ctxt:]   # Return only target tokens
 
+        # Project back to original dimension
         x = self.predictor_proj(x)
 
         return x

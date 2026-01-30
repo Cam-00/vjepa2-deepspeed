@@ -19,23 +19,30 @@ def make_transforms(
     motion_shift=False,
     crop_size=224,
     normalize=((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    eval_mode=False,
 ):
+    if not eval_mode:
+        _frames_augmentation = VideoTransform(
+            random_horizontal_flip=random_horizontal_flip,
+            random_resize_aspect_ratio=random_resize_aspect_ratio,
+            random_resize_scale=random_resize_scale,
+            reprob=reprob,
+            auto_augment=auto_augment,
+            motion_shift=motion_shift,
+            crop_size=crop_size,
+            normalize=normalize,
+        )
+    else:
+        _frames_augmentation = VideoTransformEval(
+            crop_size=crop_size,
+            normalize=normalize,
+        )
 
-    _frames_augmentation = VideoTransform(
-        random_horizontal_flip=random_horizontal_flip,
-        random_resize_aspect_ratio=random_resize_aspect_ratio,
-        random_resize_scale=random_resize_scale,
-        reprob=reprob,
-        auto_augment=auto_augment,
-        motion_shift=motion_shift,
-        crop_size=crop_size,
-        normalize=normalize,
-    )
     return _frames_augmentation
 
 
 class VideoTransform(object):
-
+    """ Video transform for training model"""
     def __init__(
         self,
         random_horizontal_flip=True,
@@ -68,6 +75,7 @@ class VideoTransform(object):
             interpolation="bicubic",
         )
 
+        # resize crop to (224*224 or 256*256)
         self.spatial_transform = (
             video_transforms.random_resized_crop_with_shift if motion_shift else video_transforms.random_resized_crop
         )
@@ -95,6 +103,7 @@ class VideoTransform(object):
         else:
             buffer = torch.tensor(buffer, dtype=torch.float32)
 
+        # transform video frames shape from decord（T H W C）to model input shape(B, C, T, H, W)
         buffer = buffer.permute(3, 0, 1, 2)  # T H W C -> C T H W
 
         buffer = self.spatial_transform(
@@ -112,6 +121,44 @@ class VideoTransform(object):
             buffer = buffer.permute(1, 0, 2, 3)
             buffer = self.erase_transform(buffer)
             buffer = buffer.permute(1, 0, 2, 3)
+
+        return buffer
+
+
+class VideoTransformEval(object):
+    """ Video size crop for val model"""
+    def __init__(
+        self,
+        auto_augment=False,
+        crop_size=224,
+        normalize=((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    ):
+        self.auto_augment = auto_augment
+        self.crop_size = crop_size
+        self.mean = torch.tensor(normalize[0], dtype=torch.float32)
+        self.std = torch.tensor(normalize[1], dtype=torch.float32)
+        if not self.auto_augment:
+            # Without auto-augment, PIL and tensor conversions simply scale uint8 space by 255.
+            self.mean *= 255.0
+            self.std *= 255.0
+
+        self.spatial_transform = video_transforms.CenterCrop(self.crop_size)
+
+    def __call__(self, buffer):
+
+        if torch.is_tensor(buffer):
+            # TODO: ensure input is always a tensor?
+            buffer = buffer.to(torch.float32)
+        else:
+            buffer = torch.tensor(buffer, dtype=torch.float32)
+
+        buffer = self.spatial_transform(buffer)
+
+        if isinstance(buffer, list):
+            buffer = torch.stack(buffer)  # (T, H, W, C)
+
+        buffer = buffer.permute(3, 0, 1, 2)  # T H W C -> C T H W
+        buffer = _tensor_normalize_inplace(buffer, self.mean, self.std)
 
         return buffer
 

@@ -37,46 +37,123 @@ logging.basicConfig()
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
+# 原代码
+# def init_module(
+#     resolution: int,
+#     frames_per_clip: int,
+#     checkpoint: str,
+#     # --
+#     model_kwargs: dict,
+#     wrapper_kwargs: dict,
+# ):
+#     logger.info(f"Loading pretrained model from {checkpoint}")
+#     checkpoint = torch.load(checkpoint, map_location="cpu")
+#
+#     enc_kwargs = model_kwargs["encoder"]
+#     enc_ckp_key = enc_kwargs.get("checkpoint_key")
+#     enc_model_name = enc_kwargs.get("model_name")
+#
+#     model = vit.__dict__[enc_model_name](img_size=resolution, num_frames=frames_per_clip, **enc_kwargs)
+#
+#     pretrained_dict = checkpoint[enc_ckp_key]
+#     # --
+#     pretrained_dict = {k.replace("module.", ""): v for k, v in pretrained_dict.items()}
+#     pretrained_dict = {k.replace("backbone.", ""): v for k, v in pretrained_dict.items()}
+#     for k, v in model.state_dict().items():
+#         if k not in pretrained_dict:
+#             logger.info(f'key "{k}" could not be found in loaded state dict')
+#         elif pretrained_dict[k].shape != v.shape:
+#             logger.info(f'key "{k}" is of different shape in model and loaded state dict')
+#             pretrained_dict[k] = v
+#     msg = model.load_state_dict(pretrained_dict, strict=False)
+#     logger.info(f"loaded pretrained model with msg: {msg}")
+#     print(model)
+#
+#     model = ClipAggregation(
+#         model,
+#         tubelet_size=model.tubelet_size,
+#         **wrapper_kwargs,
+#     )
+#     del checkpoint
+#     return model
 
+# 优化后代码，可以加载deepspeed保存的checkpoint
 def init_module(
-    resolution: int,
-    frames_per_clip: int,
-    checkpoint: str,
-    # --
-    model_kwargs: dict,
-    wrapper_kwargs: dict,
+        resolution: int,
+        frames_per_clip: int,
+        checkpoint: str,
+        model_kwargs: dict,
+        wrapper_kwargs: dict,
 ):
-    logger.info(f"Loading pretrained model from {checkpoint}")
-    checkpoint = torch.load(checkpoint, map_location="cpu")
+    logger.info(f"Loading checkpoint from {checkpoint}")
+    # 1. 加载全量权重文件
+    # 注意：如果是 DeepSpeed 保存的目录，请指向目录下的 mp_rank_00_model_states.pt
+    # 或者使用 zero_to_fp32.py 合并后的文件
+    ckpt_dict = torch.load(checkpoint, map_location="cpu")
 
     enc_kwargs = model_kwargs["encoder"]
-    enc_ckp_key = enc_kwargs.get("checkpoint_key")
     enc_model_name = enc_kwargs.get("model_name")
 
-    model = vit.__dict__[enc_model_name](img_size=resolution, num_frames=frames_per_clip, **enc_kwargs)
+    # 2. 提取真正的 state_dict 核心
+    # DeepSpeed 默认将模型包装在 'module' 键下
+    if "module" in ckpt_dict:
+        full_state_dict = ckpt_dict["module"]
+    elif "encoder" in ckpt_dict:  # 兼容原有的旧格式
+        full_state_dict = ckpt_dict["encoder"]
+    else:
+        full_state_dict = ckpt_dict
 
-    pretrained_dict = checkpoint[enc_ckp_key]
-    # --
-    pretrained_dict = {k.replace("module.", ""): v for k, v in pretrained_dict.items()}
-    pretrained_dict = {k.replace("backbone.", ""): v for k, v in pretrained_dict.items()}
-    for k, v in model.state_dict().items():
-        if k not in pretrained_dict:
-            logger.info(f'key "{k}" could not be found in loaded state dict')
-        elif pretrained_dict[k].shape != v.shape:
-            logger.info(f'key "{k}" is of different shape in model and loaded state dict')
-            pretrained_dict[k] = v
-    msg = model.load_state_dict(pretrained_dict, strict=False)
+    # 3. 实例化基础 ViT 模型
+    model = vit.__dict__[enc_model_name](
+        img_size=resolution,
+        num_frames=frames_per_clip,
+        **enc_kwargs
+    )
+
+    # 4. 关键：针对 MultiModelWrapper 的键名转换
+    # 目标：将 "target_encoder.backbone.patch_embed.weight" -> "backbone.patch_embed.weight"
+    # 或者直接到具体参数名
+    new_state_dict = {}
+    prefix = "target_encoder."
+
+    for k, v in full_state_dict.items():
+        # 移除 DeepSpeed 可能添加的 module. 前缀
+        clean_k = k.replace("module.", "")
+
+        # 识别属于 target_encoder 的部分
+        if clean_k.startswith(prefix):
+            # 移除 "encoder."，保留后续结构（如 "backbone.xxx" 或 "patch_embed.xxx"）
+            inner_k = clean_k[len(prefix):]
+            new_state_dict[inner_k] = v
+
+    # 5. 参数校验与对齐
+    model_state = model.state_dict()
+    for k in list(new_state_dict.keys()):
+        if k not in model_state:
+            # 尝试进一步剥离 "backbone." 前缀，以匹配基础 ViT 的结构
+            if k.startswith("backbone."):
+                simple_k = k.replace("backbone.", "")
+                if simple_k in model_state:
+                    new_state_dict[simple_k] = new_state_dict.pop(k)
+                    continue
+            logger.info(f'key "{k}" could not be matched to model')
+        elif new_state_dict[k].shape != model_state[k].shape:
+            logger.info(f'key "{k}" shape mismatch: {new_state_dict[k].shape} vs {model_state[k].shape}')
+            new_state_dict.pop(k)
+
+    # 6. 加载权重
+    msg = model.load_state_dict(new_state_dict, strict=False)
     logger.info(f"loaded pretrained model with msg: {msg}")
-    print(model)
 
+    # 7. 再次包装为 ClipAggregations
     model = ClipAggregation(
         model,
         tubelet_size=model.tubelet_size,
         **wrapper_kwargs,
     )
-    del checkpoint
-    return model
 
+    del ckpt_dict
+    return model
 
 class ClipAggregation(nn.Module):
     """

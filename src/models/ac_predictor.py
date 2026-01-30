@@ -41,7 +41,7 @@ class VisionTransformerPredictorAC(nn.Module):
         is_frame_causal=True,
         use_activation_checkpointing=False,
         use_rope=True,
-        action_embed_dim=7,
+        action_embed_dim=7,  # 3 dimensions for position, 3 for orientation, and 1 for the gripper state
         use_extrinsics=False,
         **kwargs
     ):
@@ -83,7 +83,7 @@ class VisionTransformerPredictorAC(nn.Module):
                     grid_size=self.grid_height,
                     dim=predictor_embed_dim,
                     num_heads=num_heads,
-                    mlp_ratio=mlp_ratio,
+                    mlp_ratio=mlp_ratio,  # the ratio of hidden_dim / input_dim in transformer FFN layer,
                     qkv_bias=qkv_bias,
                     qk_scale=qk_scale,
                     drop=drop_rate,
@@ -106,6 +106,7 @@ class VisionTransformerPredictorAC(nn.Module):
         self.apply(self._init_weights)
         self._rescale_blocks()
 
+        # block casual attention
         attn_mask = None
         if self.is_frame_causal:
             grid_depth = self.num_frames // self.tubelet_size
@@ -114,7 +115,7 @@ class VisionTransformerPredictorAC(nn.Module):
             attn_mask = build_action_block_causal_attention_mask(
                 grid_depth, grid_height, grid_width, add_tokens=3 if use_extrinsics else 2
             )
-        self.attn_mask = attn_mask
+        self.attn_mask = attn_mask   # (N, N), N = T*(H*W+A), A = 2 or 3
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -153,6 +154,7 @@ class VisionTransformerPredictorAC(nn.Module):
             x = torch.cat([a, s, x], dim=2).flatten(1, 2)  # [B, T*(H*W+2), D]
 
         cond_tokens = 3 if self.use_extrinsics else 2
+
         attn_mask = self.attn_mask[: x.size(1), : x.size(1)].to(x.device, non_blocking=True)
 
         # Fwd prop
