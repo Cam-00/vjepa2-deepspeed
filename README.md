@@ -38,13 +38,13 @@ git clone https://github.com/Cam-00/vjepa2-deepspeed.git
 ### Training command
 For training your own v-jepa 2 model locally from scratch, just run in your terminal:
 ```
-cd /home/vjepa2_deepspeed/
+cd /home/vjepa2-deepspeed/
 deepspeed --num_gpus=2 app/main.py --fname configs/train/vitl16/pretrain-256px-16f-ds.yaml --deepspeed --deepspeed_config configs/train/vitl16/vitl16-ds-config-distributed-ds.json --devices cuda:0 cuda:1
 ```
 
 For evaluating your pretrained v-jepa 2, you should frozen pretrained v-jepa2 encoder, train your probe and finally eval model. For video classification example, using ssv2 dataset, just run the following command locally:
 ```
-cd /home/vjepa2_deepspeed
+cd /home/vjepa2-deepspeed
 python -m evals.main --fname configs/eval/vitl/ssv2_gpus.yaml --devices cuda:0 cuda:1
 ```
 ## V-JEPA 2 Pre-training
