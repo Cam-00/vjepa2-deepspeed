@@ -3,10 +3,10 @@
 
 Deepspeed Implementation of V-JEPA 2 ( Vision-based Joint Embedding Predictive Architecture ) while maintaining legacy pytoch version code. Furthermore, we develop some tools to accelerate training model, evaluating model performance and easily monitor model training status.
 
-V-JEPA 2 is a self-supervised approach to training video encoders, using internet-scale video data, that attains state-of-the-art performance on motion understanding and human action anticpation tasks. V-JEPA 2-AC is a latent action-conditioned world model post-trained from V-JEPA 2 (using a small amount of robot trajectory interaction data) that solves robot manipulation tasks without environment-specific data collection or task-specific training or calibration.
+V-JEPA 2 is a self-supervised approach to training video encoders, using internet-scale video data, that attains state-of-the-art performance on motion understanding and human action anticpation tasks. 
 
 <p align="center">
-	<img src="assets/flowchart.png" width=100%>
+	<img src="assets/vjepa2-abstract-new.png" width=60%>
 </p>
 
 <!---
@@ -18,13 +18,15 @@ V-JEPA 2 is a self-supervised approach to training video encoders, using interne
 ## Project Resources
 [[`Original Project`](https://github.com/facebookresearch/vjepa2)][[`Paper`](https://arxiv.org/abs/2506.09985)] [[`Blog`](https://ai.meta.com/blog/v-jepa-2-world-model-benchmarks)] [[`BibTex`](#Citation)]
 
-## What's New Features?
-        ** Deepspeed implementation will save more GPUs and accelerate model training.
-        ** Detailed dataset processing which is easily used from scratch.
-        ** Deeply integrated in original pytorch verion v-jepa 2.
-        ** New developed tools to monitor gradient/feature norm std & mean.
+## What's New Features In This Repo?
+####    * Deepspeed implementation will save more GPUs and accelerate model training.
+####    * Can train v-jepa 2 locally or in distributed parallel system with properly configuring model. 
+####    * Detailed dataset processing which is easily used from scratch.
+####    * Deeply integrated in original pytorch verion v-jepa 2.
+####    * New developed tools to monitor gradient/feature norm std & mean.
 
 ##  Quick Start
+You can train your v-jepa 2 on 2 RTX4090 GPUS, or even run on your laptop computer with >= 6 GB VRAM successfully.
 ### Setup
 
 ```
