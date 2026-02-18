@@ -24,4 +24,4 @@ scikit-image
 ftfy
 jupyter
 matplotlib
-faiss
+faiss-gpu-cuvs==1.12.0
